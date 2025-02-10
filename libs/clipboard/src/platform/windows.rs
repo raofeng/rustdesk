@@ -6,10 +6,10 @@
 #![allow(deref_nullptr)]
 
 use crate::{
-    allow_err, send_data, ClipboardFile, CliprdrError, CliprdrServiceContext, ResultType,
-    ERR_CODE_INVALID_PARAMETER, ERR_CODE_SERVER_FUNCTION_NONE, VEC_MSG_CHANNEL,
+    send_data, send_data_exclude, ClipboardFile, CliprdrError, CliprdrServiceContext, ResultType,
+    ERR_CODE_INVALID_PARAMETER, ERR_CODE_SEND_MSG, ERR_CODE_SERVER_FUNCTION_NONE, VEC_MSG_CHANNEL,
 };
-use hbb_common::log;
+use hbb_common::{allow_err, log};
 use std::{
     boxed::Box,
     ffi::{CStr, CString},
@@ -614,6 +614,7 @@ fn ret_to_result(ret: u32) -> Result<(), CliprdrError> {
         e => Err(CliprdrError::Unknown(e)),
     }
 }
+
 pub fn empty_clipboard(context: &mut CliprdrClientContext, conn_id: i32) -> bool {
     unsafe { TRUE == empty_cliprdr(context, conn_id as u32) }
 }
@@ -643,6 +644,7 @@ pub fn server_clip_file(
                 conn_id,
                 &format_list
             );
+            send_data_exclude(conn_id as _, ClipboardFile::TryEmpty);
             ret = server_format_list(context, conn_id, format_list);
             log::debug!(
                 "server_format_list called, conn_id {}, return {}",
@@ -739,6 +741,11 @@ pub fn server_clip_file(
                 stream_id,
                 ret
             );
+        }
+        ClipboardFile::TryEmpty => {
+            log::debug!("empty_clipboard called");
+            let ret = empty_clipboard(context, conn_id);
+            log::debug!("empty_clipboard called, conn_id {}, return {}", conn_id, ret);
         }
     }
     ret
@@ -998,7 +1005,7 @@ extern "C" fn notify_callback(conn_id: UINT32, msg: *const NOTIFICATION_MESSAGE)
         }
     };
     // no need to handle result here
-    send_data(conn_id as _, data);
+    allow_err!(send_data(conn_id as _, data));
 
     0
 }
@@ -1045,7 +1052,13 @@ extern "C" fn client_format_list(
             .iter()
             .for_each(|msg_channel| allow_err!(msg_channel.sender.send(data.clone())));
     } else {
-        send_data(conn_id, data);
+        match send_data(conn_id, data) {
+            Ok(_) => {}
+            Err(e) => {
+                log::error!("failed to send format list: {:?}", e);
+                return ERR_CODE_SEND_MSG;
+            }
+        }
     }
 
     0
@@ -1067,9 +1080,13 @@ extern "C" fn client_format_list_response(
         msg_flags
     );
     let data = ClipboardFile::FormatListResponse { msg_flags };
-    send_data(conn_id, data);
-
-    0
+    match send_data(conn_id, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::error!("failed to send format list response: {:?}", e);
+            ERR_CODE_SEND_MSG
+        }
+    }
 }
 
 extern "C" fn client_format_data_request(
@@ -1090,10 +1107,13 @@ extern "C" fn client_format_data_request(
         conn_id,
         requested_format_id
     );
-    // no need to handle result here
-    send_data(conn_id, data);
-
-    0
+    match send_data(conn_id, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::error!("failed to send format data request: {:?}", e);
+            ERR_CODE_SEND_MSG
+        }
+    }
 }
 
 extern "C" fn client_format_data_response(
@@ -1125,9 +1145,13 @@ extern "C" fn client_format_data_response(
         msg_flags,
         format_data,
     };
-    send_data(conn_id, data);
-
-    0
+    match send_data(conn_id, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::error!("failed to send format data response: {:?}", e);
+            ERR_CODE_SEND_MSG
+        }
+    }
 }
 
 extern "C" fn client_file_contents_request(
@@ -1175,9 +1199,13 @@ extern "C" fn client_file_contents_request(
         clip_data_id,
     };
     log::debug!("client_file_contents_request called, data: {:?}", &data);
-    send_data(conn_id, data);
-
-    0
+    match send_data(conn_id, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::error!("failed to send file contents request: {:?}", e);
+            ERR_CODE_SEND_MSG
+        }
+    }
 }
 
 extern "C" fn client_file_contents_response(
@@ -1213,7 +1241,11 @@ extern "C" fn client_file_contents_response(
         msg_flags,
         stream_id
     );
-    send_data(conn_id, data);
-
-    0
+    match send_data(conn_id, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::error!("failed to send file contents response: {:?}", e);
+            ERR_CODE_SEND_MSG
+        }
+    }
 }

@@ -1,10 +1,8 @@
-#[allow(dead_code)]
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
-};
+use std::sync::{Arc, Mutex, RwLock};
 
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
+#[cfg(target_os = "windows")]
+use hbb_common::ResultType;
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 use hbb_common::{allow_err, log};
 use hbb_common::{
     lazy_static,
@@ -12,22 +10,27 @@ use hbb_common::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex as TokioMutex,
     },
-    ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(target_os = "windows")]
 pub mod context_send;
 pub mod platform;
+#[cfg(target_os = "windows")]
 pub use context_send::*;
 
 #[cfg(target_os = "windows")]
 const ERR_CODE_SERVER_FUNCTION_NONE: u32 = 0x00000001;
 #[cfg(target_os = "windows")]
 const ERR_CODE_INVALID_PARAMETER: u32 = 0x00000002;
+#[cfg(target_os = "windows")]
+const ERR_CODE_SEND_MSG: u32 = 0x00000003;
 
+#[cfg(target_os = "windows")]
 pub(crate) use platform::create_cliprdr_context;
 
+// to-do: This trait may be removed, because unix file copy paste does not need it.
 /// Ability to handle Clipboard File from remote rustdesk client
 ///
 /// # Note
@@ -39,7 +42,6 @@ pub trait CliprdrServiceContext: Send + Sync {
     fn set_is_stopped(&mut self) -> Result<(), CliprdrError>;
     /// clear the content on clipboard
     fn empty_clipboard(&mut self, conn_id: i32) -> Result<bool, CliprdrError>;
-
     /// run as a server for clipboard RPC
     fn server_clip_file(&mut self, conn_id: i32, msg: ClipboardFile) -> Result<(), CliprdrError>;
 }
@@ -61,9 +63,11 @@ pub enum CliprdrError {
     #[error("failure to read clipboard")]
     OpenClipboard,
     #[error("failure to read file metadata or content")]
-    FileError { path: PathBuf, err: std::io::Error },
+    FileError { path: String, err: std::io::Error },
     #[error("invalid request")]
     InvalidRequest { description: String },
+    #[error("common request")]
+    CommonError { description: String },
     #[error("unknown cliprdr error")]
     Unknown(u32),
 }
@@ -105,6 +109,7 @@ pub enum ClipboardFile {
         stream_id: i32,
         requested_data: Vec<u8>,
     },
+    TryEmpty,
 }
 
 struct MsgChannel {
@@ -130,7 +135,7 @@ impl ClipboardFile {
         )
     }
 
-    pub fn is_stopping_allowed_from_peer(&self) -> bool {
+    pub fn is_beginning_message(&self) -> bool {
         matches!(
             self,
             ClipboardFile::MonitorReady | ClipboardFile::FormatList { .. }
@@ -196,36 +201,64 @@ pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<C
     }
 }
 
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
+pub fn remove_channel_by_conn_id(conn_id: i32) {
+    let mut lock = VEC_MSG_CHANNEL.write().unwrap();
+    if let Some(index) = lock.iter().position(|x| x.conn_id == conn_id) {
+        lock.remove(index);
+    }
+}
+
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 #[inline]
-fn send_data(conn_id: i32, data: ClipboardFile) {
+pub fn send_data(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
     #[cfg(target_os = "windows")]
     return send_data_to_channel(conn_id, data);
     #[cfg(not(target_os = "windows"))]
     if conn_id == 0 {
-        send_data_to_all(data);
+        let _ = send_data_to_all(data);
+        Ok(())
     } else {
-        send_data_to_channel(conn_id, data);
+        send_data_to_channel(conn_id, data)
     }
 }
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste",))]
+
 #[inline]
-fn send_data_to_channel(conn_id: i32, data: ClipboardFile) {
-    // no need to handle result here
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+fn send_data_to_channel(conn_id: i32, data: ClipboardFile) -> Result<(), CliprdrError> {
     if let Some(msg_channel) = VEC_MSG_CHANNEL
         .read()
         .unwrap()
         .iter()
         .find(|x| x.conn_id == conn_id)
     {
-        allow_err!(msg_channel.sender.send(data));
+        msg_channel
+            .sender
+            .send(data)
+            .map_err(|e| CliprdrError::CommonError {
+                description: e.to_string(),
+            })
+    } else {
+        Err(CliprdrError::InvalidRequest {
+            description: "conn_id not found".to_string(),
+        })
     }
 }
 
-#[cfg(feature = "unix-file-copy-paste")]
 #[inline]
+#[cfg(target_os = "windows")]
+pub fn send_data_exclude(conn_id: i32, data: ClipboardFile) {
+    // Need more tests to see if it's necessary to handle the error.
+    for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {
+        if msg_channel.conn_id != conn_id {
+            allow_err!(msg_channel.sender.send(data.clone()));
+        }
+    }
+}
+
+#[inline]
+#[cfg(feature = "unix-file-copy-paste")]
 fn send_data_to_all(data: ClipboardFile) {
-    // no need to handle result here
+    // Need more tests to see if it's necessary to handle the error.
     for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {
         allow_err!(msg_channel.sender.send(data.clone()));
     }
